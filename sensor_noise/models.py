@@ -27,6 +27,7 @@ class Recording:
     time_s: np.ndarray
     channels: dict[str, np.ndarray]
     sample_rate_hz: float
+    load_warnings: list[str] = field(default_factory=list)
 
     @property
     def channel_names(self) -> list[str]:

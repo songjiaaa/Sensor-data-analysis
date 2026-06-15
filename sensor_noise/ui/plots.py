@@ -24,6 +24,7 @@ class PlotController:
         self.axes: dict[str, object] = {}
         self.canvas: dict[str, FigureCanvasTkAgg] = {}
         self._multi_bars: dict[str, object] = {}
+        self._multi_channel_keys: tuple[str, ...] = ()
         for key, frame in frames.items():
             fig = Figure(figsize=(7, 4), dpi=100)
             canvas = FigureCanvasTkAgg(fig, master=frame)
@@ -53,7 +54,9 @@ class PlotController:
 
     def show_multi(self, std_by_channel: dict[str, float], highlight: str, full: bool = False) -> None:
         ax = self.axes["multi"]
-        if full or not self._multi_bars:
+        channel_keys = tuple(std_by_channel.keys())
+        if full or not self._multi_bars or self._multi_channel_keys != channel_keys:
+            self._multi_channel_keys = channel_keys
             ax.clear()
             self._multi_bars = {}
             for ch, std in std_by_channel.items():
@@ -69,6 +72,16 @@ class PlotController:
                 bar.set_alpha(1.0 if ch == highlight else 0.55)
         ax.set_title(f"各通道 σ 对比（高亮: {highlight}）")
         self.canvas["multi"].draw_idle()
+
+    def clear_all(self) -> None:
+        """清空全部图表缓存与画布。"""
+        self._multi_bars = {}
+        self._multi_channel_keys = ()
+        for key in ("time", "psd", "allan", "hist", "multi"):
+            ax = self.axes[key]
+            ax.clear()
+            ax.set_title("")
+            self.canvas[key].draw_idle()
 
     def prewarm(self, cache: PlotCache) -> None:
         for key in ("time", "psd", "allan", "hist"):

@@ -20,7 +20,7 @@ def compute_stats(data: np.ndarray) -> NoiseStats:
     return NoiseStats(
         mean=mean,
         std=std,
-        rms_noise=std,
+        rms_noise=float(np.sqrt(np.mean(centered**2))),
         min_val=float(np.min(data)),
         max_val=float(np.max(data)),
         peak_to_peak=float(np.max(data) - np.min(data)),
@@ -32,6 +32,7 @@ def compute_stats(data: np.ndarray) -> NoiseStats:
 
 
 def compute_allan(data: np.ndarray, fs: float, max_points: int = 20) -> tuple[np.ndarray, np.ndarray]:
+    """简化非重叠 Allan 偏差，用于快速浏览，非 IEEE 重叠 Allan (OADEV)。"""
     data = np.asarray(data, dtype=float)
     n = len(data)
     if n < 10:

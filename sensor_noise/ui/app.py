@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -16,7 +17,13 @@ import pandas as pd
 from sensor_noise.session import Session
 from sensor_noise.ui.plots import PlotController
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+if sys.platform == "win32":
+    _FONTS = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+elif sys.platform == "darwin":
+    _FONTS = ["PingFang SC", "Heiti SC", "DejaVu Sans"]
+else:
+    _FONTS = ["Noto Sans CJK SC", "WenQuanYi Micro Hei", "DejaVu Sans"]
+plt.rcParams["font.sans-serif"] = _FONTS
 plt.rcParams["axes.unicode_minus"] = False
 
 
@@ -55,9 +62,10 @@ class MainWindow(tk.Tk):
         self.session = Session()
         self.current_channel = tk.StringVar()
         self._sync = False
+        self._alive = True
         self._progress: ProgressDialog | None = None
         self._build()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self) -> None:
         top = ttk.Frame(self, padding=8)
@@ -110,6 +118,25 @@ class MainWindow(tk.Tk):
         self.plots = PlotController(self.notebook, frames)
         self.notebook.bind("<<NotebookTabChanged>>", lambda _: self._refresh_view())
 
+    def _on_close(self) -> None:
+        self._alive = False
+        if self._progress:
+            self._progress.close()
+            self._progress = None
+        self.destroy()
+
+    def _safe_after(self, callback) -> None:
+        if not self._alive:
+            return
+        try:
+            if self.winfo_exists():
+                callback()
+        except tk.TclError:
+            pass
+
+    def _schedule(self, callback) -> None:
+        self.after(0, lambda: self._safe_after(callback))
+
     def _set_busy(self, busy: bool) -> None:
         state = tk.DISABLED if busy else tk.NORMAL
         self.open_btn.config(state=state)
@@ -128,9 +155,9 @@ class MainWindow(tk.Tk):
     def _load_worker(self, path: str) -> None:
         try:
             rec = self.session.load(path)
-            self.after(0, lambda: self._on_loaded(path, None))
-        except Exception as e:
-            self.after(0, lambda: self._on_loaded(path, e))
+            self._schedule(lambda: self._on_loaded(path, None))
+        except Exception as err:
+            self._schedule(lambda err=err: self._on_loaded(path, err))
 
     def _on_loaded(self, path: str, err: Exception | None) -> None:
         self._set_busy(False)
@@ -139,6 +166,7 @@ class MainWindow(tk.Tk):
             return
         rec = self.session.recording
         assert rec is not None
+        self.plots.clear_all()
         self.file_label.config(text=Path(path).name, foreground="black")
         self.channel_combo["values"] = rec.channel_names
         self.current_channel.set(rec.channel_names[0])
@@ -150,6 +178,8 @@ class MainWindow(tk.Tk):
         )
         self.tree.delete(*self.tree.get_children())
         self._row_ids.clear()
+        if rec.load_warnings:
+            messagebox.showwarning("加载提示", "\n".join(rec.load_warnings))
 
     def _analyze(self) -> None:
         if not self.session.ready:
@@ -168,25 +198,30 @@ class MainWindow(tk.Tk):
 
         def worker() -> None:
             try:
-                self.session.analyze(on_progress=lambda d, t, c: self.after(0, lambda: self._progress.update(d, t, c)))
-                self.after(0, self._on_analyzed_ok)
-            except Exception as e:
-                self.after(0, lambda: self._on_analyzed_fail(e))
+                def on_progress(done: int, total: int, channel: str) -> None:
+                    def update() -> None:
+                        if self._progress:
+                            self._progress.update(done, total, channel)
+
+                    self._schedule(update)
+
+                self.session.analyze(on_progress=on_progress)
+                self._schedule(self._on_analyzed_ok)
+            except Exception as err:
+                self._schedule(lambda err=err: self._on_analyzed_fail(err))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_analyzed_ok(self) -> None:
         if self._progress:
             self._progress.close()
+            self._progress = None
         self._set_busy(False)
         self._fill_table()
         ch = self.current_channel.get()
         if ch not in self.session.results:
             ch = next(iter(self.session.results))
             self.current_channel.set(ch)
-        r = self.session.get(ch)
-        if r and r.plot:
-            self.plots.prewarm(r.plot)
         std_map = {k: v.stats.std for k, v in self.session.results.items()}
         self.plots.show_multi(std_map, ch, full=True)
         self._select_channel(ch)
@@ -194,6 +229,7 @@ class MainWindow(tk.Tk):
     def _on_analyzed_fail(self, err: Exception) -> None:
         if self._progress:
             self._progress.close()
+            self._progress = None
         self._set_busy(False)
         messagebox.showerror("分析失败", str(err))
 

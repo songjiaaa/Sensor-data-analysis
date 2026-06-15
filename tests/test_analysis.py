@@ -16,7 +16,7 @@ class TestComputeStats(unittest.TestCase):
         stats = compute_stats(data)
         self.assertAlmostEqual(stats.mean, 5.0, delta=0.2)
         self.assertAlmostEqual(stats.std, 2.0, delta=0.2)
-        self.assertEqual(stats.rms_noise, stats.std)
+        self.assertAlmostEqual(stats.rms_noise, 2.0, delta=0.2)
         self.assertEqual(stats.n_samples, 1000)
 
 

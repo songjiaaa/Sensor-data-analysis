@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sensor_noise.analysis import run_pipeline, stats_table
+from sensor_noise.analysis import build_time_mask, run_pipeline, stats_table
 from sensor_noise.loaders import load_recording
 from sensor_noise.models import ChannelResult, Recording
 
@@ -39,6 +39,7 @@ class Session:
         t0, t1 = max(t0, f0), min(t1, f1)
         if t1 <= t0:
             raise ValueError(f"时间范围 [{t0}, {t1}] 无效")
+        build_time_mask(self.recording.time_s, (t0, t1))
         self.time_range = (t0, t1)
         return self.time_range
 

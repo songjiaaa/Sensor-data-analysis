@@ -1,6 +1,8 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+echo 正在检查打包依赖...
+pip install -r requirements-dev.txt -q
 echo 正在打包，请稍候...
 pyinstaller --noconfirm --clean build_exe.spec
 if %ERRORLEVEL% EQU 0 (

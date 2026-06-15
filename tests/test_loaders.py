@@ -72,8 +72,8 @@ class TestCsvLoading(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "单调"):
                 load_recording(path)
 
-    def test_uses_meta_sample_rate_when_consistent(self) -> None:
-        rows, _, _ = _make_rows()
+    def test_uses_duration_based_rate(self) -> None:
+        rows, _, _ = _make_rows(n=300, fs=100.0)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "meta.csv"
             _write_csv(
@@ -83,10 +83,26 @@ class TestCsvLoading(unittest.TestCase):
                 meta_lines=["#平均帧率(Hz),100"],
             )
             rec = load_recording(path)
-            self.assertAlmostEqual(rec.sample_rate_hz, 100.0)
+            self.assertAlmostEqual(rec.sample_rate_hz, 100.0, delta=1.0)
             self.assertEqual(rec.load_warnings, [])
 
-    def test_prefers_time_rate_when_meta_mismatch(self) -> None:
+    def test_ignores_nominal_sample_rate(self) -> None:
+        rows, _, _ = _make_rows(fs=100.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nominal_only.csv"
+            _write_csv(
+                path,
+                ["time", "ch1", "ch2"],
+                rows,
+                meta_lines=["#标称帧率(Hz),500"],
+            )
+            rec = load_recording(path)
+            self.assertAlmostEqual(rec.sample_rate_hz, 100.0, delta=1.0)
+            self.assertEqual(len(rec.load_warnings), 1)
+            self.assertIn("标称帧率", rec.load_warnings[0])
+            self.assertIn("平均帧率", rec.load_warnings[0])
+
+    def test_warns_when_nominal_differs_from_average(self) -> None:
         rows, _, _ = _make_rows(fs=100.0)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "mismatch.csv"
@@ -94,12 +110,14 @@ class TestCsvLoading(unittest.TestCase):
                 path,
                 ["time", "ch1", "ch2"],
                 rows,
-                meta_lines=["#平均帧率(Hz),500"],
+                meta_lines=["#平均帧率(Hz),500", "#标称帧率(Hz),500"],
             )
             rec = load_recording(path)
             self.assertAlmostEqual(rec.sample_rate_hz, 100.0, delta=1.0)
             self.assertEqual(len(rec.load_warnings), 1)
-            self.assertIn("时间列估算", rec.load_warnings[0])
+            self.assertIn("标称帧率", rec.load_warnings[0])
+            self.assertIn("平均帧率", rec.load_warnings[0])
+            self.assertNotIn("时长估算", rec.load_warnings[0])
 
     def test_rejects_duplicate_columns(self) -> None:
         rows, _, _ = _make_rows()
@@ -117,10 +135,49 @@ class TestCsvLoading(unittest.TestCase):
                 path,
                 ["time", "ch1", "ch2"],
                 rows,
-                meta_lines=["#avg_sample_rate_hz,100"],
+                meta_lines=["#avg_sample_rate_hz,100", "#nominal_sample_rate_hz,999"],
             )
             rec = load_recording(path)
-            self.assertAlmostEqual(rec.sample_rate_hz, 100.0)
+            self.assertAlmostEqual(rec.sample_rate_hz, 100.0, delta=1.0)
+
+    def test_corrects_time_when_meta_duration_mismatches(self) -> None:
+        """模拟 THM060A 采集：时间列为 1 ms 步进计数，元数据时长为真实录制时长。"""
+        n = 300
+        true_fs = 10.0
+        true_dur = (n - 1) / true_fs
+        rows = [[i * 0.001, 1.0 + i * 0.01, 2.0] for i in range(n)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "thm_style.csv"
+            _write_csv(
+                path,
+                ["时间(s)", "ch1", "ch2"],
+                rows,
+                meta_lines=[
+                    f"#时长(s),{true_dur}",
+                    f"#平均帧率(Hz),{true_fs}",
+                    f"#总帧数,{n}",
+                ],
+            )
+            rec = load_recording(path)
+            self.assertAlmostEqual(rec.sample_rate_hz, true_fs, delta=0.1)
+            self.assertAlmostEqual(rec.time_s[-1] - rec.time_s[0], true_dur, delta=0.01)
+            self.assertTrue(any("时间列时长" in w for w in rec.load_warnings))
+
+    def test_keeps_time_column_when_meta_duration_agrees(self) -> None:
+        rows, _, t = _make_rows(n=300, fs=100.0)
+        true_dur = t[-1] - t[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "consistent.csv"
+            _write_csv(
+                path,
+                ["time", "ch1", "ch2"],
+                rows,
+                meta_lines=[f"#时长(s),{true_dur}", "#平均帧率(Hz),100"],
+            )
+            rec = load_recording(path)
+            self.assertAlmostEqual(rec.sample_rate_hz, 100.0, delta=1.0)
+            np.testing.assert_allclose(rec.time_s, t, rtol=0, atol=1e-9)
+            self.assertEqual(rec.load_warnings, [])
 
 
 class TestXlsxLoading(unittest.TestCase):

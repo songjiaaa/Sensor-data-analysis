@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -29,12 +30,13 @@ plt.rcParams["axes.unicode_minus"] = False
 
 class ProgressDialog:
     def __init__(self, parent: tk.Tk, total: int) -> None:
+        self._parent = parent
         self.win = tk.Toplevel(parent)
         self.win.title("正在分析")
         self.win.geometry("400x110")
         self.win.resizable(False, False)
         self.win.transient(parent)
-        self.win.grab_set()
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)
         ttk.Label(self.win, text="正在分析全部通道...").pack(padx=12, pady=(12, 6))
         self.label = ttk.Label(self.win, text=f"0 / {total}")
         self.label.pack()
@@ -44,12 +46,17 @@ class ProgressDialog:
     def update(self, done: int, total: int, channel: str) -> None:
         self.var.set(done)
         self.label.config(text=f"{done} / {total}  {channel}")
-        self.win.update_idletasks()
 
     def close(self) -> None:
+        for widget in (self.win, self._parent):
+            try:
+                if widget.winfo_exists():
+                    widget.grab_release()
+            except tk.TclError:
+                pass
         try:
-            self.win.grab_release()
-            self.win.destroy()
+            if self.win.winfo_exists():
+                self.win.destroy()
         except tk.TclError:
             pass
 
@@ -64,8 +71,10 @@ class MainWindow(tk.Tk):
         self._sync = False
         self._alive = True
         self._progress: ProgressDialog | None = None
+        self._task_queue: queue.Queue = queue.Queue()
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(50, self._poll_task_queue)
 
     def _build(self) -> None:
         top = ttk.Frame(self, padding=8)
@@ -116,6 +125,8 @@ class MainWindow(tk.Tk):
             self.notebook.add(f, text=name)
             frames[PlotController.TABS[name]] = f
         self.plots = PlotController(self.notebook, frames)
+        if self.notebook.tabs():
+            self.notebook.select(self.notebook.tabs()[0])
         self.notebook.bind("<<NotebookTabChanged>>", lambda _: self._refresh_view())
 
     def _on_close(self) -> None:
@@ -125,17 +136,34 @@ class MainWindow(tk.Tk):
             self._progress = None
         self.destroy()
 
-    def _safe_after(self, callback) -> None:
+    def _poll_task_queue(self) -> None:
         if not self._alive:
             return
         try:
+            self._handle_task(self._task_queue.get_nowait())
+        except queue.Empty:
+            pass
+        try:
             if self.winfo_exists():
-                callback()
+                self.after(50, self._poll_task_queue)
         except tk.TclError:
             pass
 
-    def _schedule(self, callback) -> None:
-        self.after(0, lambda: self._safe_after(callback))
+    def _handle_task(self, task: tuple) -> None:
+        kind = task[0]
+        if kind == "loaded":
+            _, path, err = task
+            self._on_loaded(path, err)
+        elif kind == "analyze_progress":
+            _, done, total, channel = task
+            self.meta.config(text=f"正在分析 {done} / {total}  {channel}")
+            if self._progress:
+                self._progress.update(done, total, channel)
+        elif kind == "analyzed_ok":
+            self._on_analyzed_ok()
+        elif kind == "analyzed_fail":
+            _, err = task
+            self._on_analyzed_fail(err)
 
     def _set_busy(self, busy: bool) -> None:
         state = tk.DISABLED if busy else tk.NORMAL
@@ -154,10 +182,19 @@ class MainWindow(tk.Tk):
 
     def _load_worker(self, path: str) -> None:
         try:
-            rec = self.session.load(path)
-            self._schedule(lambda: self._on_loaded(path, None))
+            self.session.load(path)
+            self._task_queue.put(("loaded", path, None))
         except Exception as err:
-            self._schedule(lambda err=err: self._on_loaded(path, err))
+            self._task_queue.put(("loaded", path, err))
+
+    def _meta_summary(self) -> str:
+        rec = self.session.recording
+        if rec is None:
+            return ""
+        return (
+            f"帧数 {rec.meta.total_frames} | 采样率 {rec.sample_rate_hz:.1f} Hz | "
+            f"时间 [{rec.time_s[0]:.2f}, {rec.time_s[-1]:.2f}] s | 通道 {len(rec.channel_names)}"
+        )
 
     def _on_loaded(self, path: str, err: Exception | None) -> None:
         self._set_busy(False)
@@ -172,10 +209,7 @@ class MainWindow(tk.Tk):
         self.current_channel.set(rec.channel_names[0])
         self.t_start.set(f"{rec.time_s[0]:.3f}")
         self.t_end.set(f"{rec.time_s[-1]:.3f}")
-        self.meta.config(
-            text=f"帧数 {rec.meta.total_frames} | 采样率 {rec.sample_rate_hz:.1f} Hz | "
-            f"时间 [{rec.time_s[0]:.2f}, {rec.time_s[-1]:.2f}] s | 通道 {len(rec.channel_names)}"
-        )
+        self.meta.config(text=self._meta_summary())
         self.tree.delete(*self.tree.get_children())
         self._row_ids.clear()
         if rec.load_warnings:
@@ -194,21 +228,18 @@ class MainWindow(tk.Tk):
             return
         total = len(self.session.recording.channel_names)
         self._set_busy(True)
+        self.meta.config(text=f"正在分析 0 / {total} ...")
         self._progress = ProgressDialog(self, total)
 
         def worker() -> None:
             try:
                 def on_progress(done: int, total: int, channel: str) -> None:
-                    def update() -> None:
-                        if self._progress:
-                            self._progress.update(done, total, channel)
-
-                    self._schedule(update)
+                    self._task_queue.put(("analyze_progress", done, total, channel))
 
                 self.session.analyze(on_progress=on_progress)
-                self._schedule(self._on_analyzed_ok)
+                self._task_queue.put(("analyzed_ok",))
             except Exception as err:
-                self._schedule(lambda err=err: self._on_analyzed_fail(err))
+                self._task_queue.put(("analyzed_fail", err))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -217,20 +248,23 @@ class MainWindow(tk.Tk):
             self._progress.close()
             self._progress = None
         self._set_busy(False)
-        self._fill_table()
-        ch = self.current_channel.get()
-        if ch not in self.session.results:
-            ch = next(iter(self.session.results))
-            self.current_channel.set(ch)
-        std_map = {k: v.stats.std for k, v in self.session.results.items()}
-        self.plots.show_multi(std_map, ch, full=True)
-        self._select_channel(ch)
+        self.meta.config(text=self._meta_summary())
+        try:
+            self._fill_table()
+            ch = self.current_channel.get()
+            if ch not in self.session.results:
+                ch = next(iter(self.session.results))
+                self.current_channel.set(ch)
+            self.after(50, self._refresh_view)
+        except Exception as err:
+            messagebox.showerror("分析失败", str(err))
 
     def _on_analyzed_fail(self, err: Exception) -> None:
         if self._progress:
             self._progress.close()
             self._progress = None
         self._set_busy(False)
+        self.meta.config(text=self._meta_summary())
         messagebox.showerror("分析失败", str(err))
 
     def _fill_table(self) -> None:
@@ -249,27 +283,26 @@ class MainWindow(tk.Tk):
             self._row_ids[row["通道"]] = self.tree.insert("", tk.END, values=vals)
 
     def _select_channel(self, channel: str) -> None:
-        if channel not in self.session.results:
+        if channel not in self.session.results or self._sync:
             return
         self._sync = True
-        self.current_channel.set(channel)
-        rid = self._row_ids.get(channel)
-        if rid:
-            self.tree.selection_set(rid)
-            self.tree.see(rid)
-        self._sync = False
-        r = self.session.get(channel)
-        if r and r.plot:
-            self.plots.prewarm(r.plot)
-        self._refresh_view()
+        try:
+            self.current_channel.set(channel)
+            self._refresh_view()
+        finally:
+            self._sync = False
 
     def _on_tree_select(self, _=None) -> None:
         if self._sync:
             return
         sel = self.tree.selection()
-        if sel:
-            ch = self.tree.item(sel[0], "values")[0]
-            self._select_channel(ch)
+        if not sel:
+            return
+        ch = self.tree.item(sel[0], "values")[0]
+        if ch == self.current_channel.get():
+            self._refresh_view()
+            return
+        self._select_channel(ch)
 
     def _refresh_view(self) -> None:
         ch = self.current_channel.get()

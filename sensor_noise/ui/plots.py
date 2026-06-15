@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import tkinter as tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from sensor_noise.models import PlotCache
@@ -29,12 +30,25 @@ class PlotController:
             fig = Figure(figsize=(7, 4), dpi=100)
             canvas = FigureCanvasTkAgg(fig, master=frame)
             canvas.get_tk_widget().pack(fill="both", expand=True)
-            NavigationToolbar2Tk(canvas, frame)
             self.axes[key] = fig.add_subplot(111)
             self.canvas[key] = canvas
 
     def current_tab(self) -> str:
-        return str(self.notebook.tab(self.notebook.index("selected"), "text"))
+        selected = self.notebook.select()
+        if not selected:
+            tabs = self.notebook.tabs()
+            if not tabs:
+                return next(iter(self.TABS))
+            self.notebook.select(tabs[0])
+            selected = self.notebook.select()
+        return str(self.notebook.tab(selected, "text"))
+
+    def _redraw(self, key: str) -> None:
+        try:
+            if self.canvas[key].get_tk_widget().winfo_ismapped():
+                self.canvas[key].draw_idle()
+        except tk.TclError:
+            pass
 
     def show_channel(self, cache: PlotCache | None, tab: str | None = None) -> None:
         tab = tab or self.current_tab()
@@ -50,7 +64,7 @@ class PlotController:
             "hist": self._hist,
         }[key]
         draw(self.axes[key], cache)
-        self.canvas[key].draw_idle()
+        self._redraw(key)
 
     def show_multi(self, std_by_channel: dict[str, float], highlight: str, full: bool = False) -> None:
         ax = self.axes["multi"]
@@ -71,21 +85,16 @@ class PlotController:
                 bar.set_color("tab:orange" if ch == highlight else "tab:blue")
                 bar.set_alpha(1.0 if ch == highlight else 0.55)
         ax.set_title(f"各通道 σ 对比（高亮: {highlight}）")
-        self.canvas["multi"].draw_idle()
+        self._redraw("multi")
 
     def clear_all(self) -> None:
-        """清空全部图表缓存与画布。"""
+        """清空全部图表缓存与画布（不触发重绘，避免空闲回调堆积）。"""
         self._multi_bars = {}
         self._multi_channel_keys = ()
         for key in ("time", "psd", "allan", "hist", "multi"):
             ax = self.axes[key]
             ax.clear()
             ax.set_title("")
-            self.canvas[key].draw_idle()
-
-    def prewarm(self, cache: PlotCache) -> None:
-        for key in ("time", "psd", "allan", "hist"):
-            self.show_channel(cache, tab={v: k for k, v in self.TABS.items()}[key])
 
     _CHANNEL_DRAWERS = {
         "time": "_time",

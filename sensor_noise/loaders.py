@@ -203,35 +203,99 @@ def _validate_unique_columns(columns: list[str]) -> None:
 
 
 def _sample_rate_from_time(time_s: np.ndarray) -> float:
-    if len(time_s) <= 1:
+    """根据时间列时长与样本数计算平均帧率。"""
+    n = len(time_s)
+    if n <= 1:
         return 0.0
+    duration = float(time_s[-1] - time_s[0])
+    if duration > 0:
+        return (n - 1) / duration
     positive_dt = np.diff(time_s)
     positive_dt = positive_dt[positive_dt > 0]
-    if len(positive_dt) == 0:
+    if len(positive_dt) > 0:
+        return float(1.0 / np.median(positive_dt))
+    return 0.0
+
+
+def _sample_rate_from_meta_duration(meta: RecordingMeta, n_samples: int) -> float:
+    """根据元数据中的时长与帧数计算平均帧率（仍不使用标称帧率）。"""
+    if meta.duration_s > 0 and n_samples > 1:
+        return (n_samples - 1) / meta.duration_s
+    return 0.0
+
+
+def _time_span(time_s: np.ndarray) -> float:
+    if len(time_s) <= 1:
         return 0.0
-    return float(1.0 / np.median(positive_dt))
+    return float(time_s[-1] - time_s[0])
 
 
-def _resolve_sample_rate(meta: RecordingMeta, time_s: np.ndarray) -> tuple[float, list[str]]:
-    warnings: list[str] = []
-    from_time = _sample_rate_from_time(time_s)
-    meta_rate = meta.avg_sample_rate_hz if meta.avg_sample_rate_hz > 0 else meta.nominal_sample_rate_hz
+def _rebuild_time_axis(time_s: np.ndarray, duration_s: float) -> np.ndarray:
+    n = len(time_s)
+    if n <= 1:
+        return time_s.copy()
+    t0 = float(time_s[0])
+    return t0 + np.linspace(0.0, duration_s, n, dtype=np.float64)
 
-    if meta_rate > 0 and from_time > 0:
-        rel_diff = abs(meta_rate - from_time) / from_time
-        if rel_diff > SAMPLE_RATE_MISMATCH_THRESHOLD:
+
+def _append_rate_mismatch_warnings(
+    warnings: list[str], meta: RecordingMeta, sample_rate: float
+) -> None:
+    if sample_rate <= 0:
+        return
+    if meta.nominal_sample_rate_hz > 0:
+        rel = abs(meta.nominal_sample_rate_hz - sample_rate) / sample_rate
+        if rel > SAMPLE_RATE_MISMATCH_THRESHOLD:
             warnings.append(
-                f"元数据采样率 ({meta_rate:.2f} Hz) 与时间列估算 ({from_time:.2f} Hz) "
-                f"偏差 {rel_diff * 100:.1f}%，已采用时间列估算值"
+                f"标称帧率 ({meta.nominal_sample_rate_hz:.2f} Hz) 与平均帧率 "
+                f"({sample_rate:.2f} Hz) 偏差 {rel * 100:.1f}%，已采用平均帧率"
             )
-            return from_time, warnings
-        return meta_rate, warnings
+    elif meta.avg_sample_rate_hz > 0:
+        rel = abs(meta.avg_sample_rate_hz - sample_rate) / sample_rate
+        if rel > SAMPLE_RATE_MISMATCH_THRESHOLD:
+            warnings.append(
+                f"元数据平均帧率 ({meta.avg_sample_rate_hz:.2f} Hz) 与平均帧率 "
+                f"({sample_rate:.2f} Hz) 偏差 {rel * 100:.1f}%，已采用平均帧率"
+            )
 
-    if meta_rate > 0:
-        return meta_rate, warnings
-    if from_time > 0:
-        return from_time, warnings
-    return 0.0, warnings
+
+def _resolve_time_and_sample_rate(
+    meta: RecordingMeta, time_s: np.ndarray
+) -> tuple[float, np.ndarray, list[str]]:
+    """推断采样率；若时间列时长与元数据时长偏差过大，按元数据重建时间轴。"""
+    warnings: list[str] = []
+    n = len(time_s)
+    time_span = _time_span(time_s)
+    rate_from_time = _sample_rate_from_time(time_s)
+    rate_from_meta = _sample_rate_from_meta_duration(meta, n)
+    meta_dur = meta.duration_s
+
+    if meta_dur > 0 and n > 1:
+        use_meta_time = time_span <= 0
+        if not use_meta_time:
+            rel_dur = abs(meta_dur - time_span) / max(meta_dur, time_span)
+            use_meta_time = rel_dur > SAMPLE_RATE_MISMATCH_THRESHOLD
+        if use_meta_time and rate_from_meta > 0:
+            corrected = _rebuild_time_axis(time_s, meta_dur)
+            if time_span > 0:
+                rel_dur = abs(meta_dur - time_span) / max(meta_dur, time_span)
+                warnings.append(
+                    f"时间列时长 ({time_span:.2f} s) 与元数据时长 ({meta_dur:.2f} s) "
+                    f"偏差 {rel_dur * 100:.1f}%，已按元数据重建时间轴"
+                )
+            _append_rate_mismatch_warnings(warnings, meta, rate_from_meta)
+            return rate_from_meta, corrected, warnings
+
+    if rate_from_time > 0:
+        _append_rate_mismatch_warnings(warnings, meta, rate_from_time)
+        return rate_from_time, time_s, warnings
+
+    if rate_from_meta > 0:
+        corrected = _rebuild_time_axis(time_s, meta_dur) if meta_dur > 0 else time_s
+        _append_rate_mismatch_warnings(warnings, meta, rate_from_meta)
+        return rate_from_meta, corrected, warnings
+
+    return 0.0, time_s, warnings
 
 
 def _validate_time_column(time_s: np.ndarray) -> None:
@@ -272,11 +336,10 @@ def _finalize_recording(path: Path, meta: RecordingMeta, df: pd.DataFrame) -> Re
     channels = {col: df[col].to_numpy(dtype=np.float64) for col in channel_cols}
     _validate_time_column(time_s)
 
-    sample_rate, load_warnings = _resolve_sample_rate(meta, time_s)
+    sample_rate, time_s, load_warnings = _resolve_time_and_sample_rate(meta, time_s)
     if sample_rate <= 0:
         raise ValueError(
-            "无法推断采样率：请在文件元数据中提供「平均帧率(Hz)」或「标称帧率(Hz)」，"
-            "或确保时间列具有有效间隔"
+            "无法推断采样率：请确保时间列具有有效时长，或在元数据中提供「时长(s)」与「总帧数」"
         )
 
     if meta.total_frames <= 0:

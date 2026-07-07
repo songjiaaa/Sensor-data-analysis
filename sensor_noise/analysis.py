@@ -11,6 +11,12 @@ from sensor_noise.models import ChannelResult, NoiseStats, PlotCache
 
 ProgressCallback = Callable[[int, int, str], None]
 
+PSD_LOW_FRAC = 0.01
+PSD_HIGH_FRAC = 0.97
+PSD_EDGE_FRAC = 0.01
+MIDBAND_START_FRAC = 0.10
+MIDBAND_END_FRAC = 0.90
+
 
 def compute_stats(data: np.ndarray) -> NoiseStats:
     data = np.asarray(data, dtype=float)
@@ -25,8 +31,8 @@ def compute_stats(data: np.ndarray) -> NoiseStats:
         max_val=float(np.max(data)),
         peak_to_peak=float(np.max(data) - np.min(data)),
         variance=float(np.var(centered, ddof=1)),
-        skewness=float(stats.skew(centered)),
-        kurtosis=float(stats.kurtosis(centered)),
+        skewness=float(stats.skew(centered, bias=False)),
+        kurtosis=float(stats.kurtosis(centered, bias=False)),
         n_samples=len(data),
     )
 
@@ -55,13 +61,30 @@ def compute_allan(data: np.ndarray, fs: float, max_points: int = 20) -> tuple[np
 
 
 def trim_psd(freqs: np.ndarray, psd: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+    """裁掉直流邻域与奈奎斯特边缘，减弱窗泄漏；最高频率约为 0.97×(fs/2)。"""
     if len(freqs) < 5:
         return freqs, psd
     nyq = fs / 2.0
-    mask = (freqs >= max(float(freqs[1]), nyq * 0.01)) & (freqs <= nyq * 0.97)
+    mask = (freqs >= max(float(freqs[1]), nyq * PSD_LOW_FRAC)) & (freqs <= nyq * PSD_HIGH_FRAC)
     f, p = freqs[mask], psd[mask]
-    edge = max(1, len(f) // 100)
+    edge = max(1, len(f) // int(1 / PSD_EDGE_FRAC))
     return f[edge:-edge], p[edge:-edge]
+
+
+def midband_psd(psd: np.ndarray) -> np.ndarray:
+    if len(psd) < 4:
+        return np.array([])
+    start = int(len(psd) * MIDBAND_START_FRAC)
+    end = int(len(psd) * MIDBAND_END_FRAC)
+    return psd[start:end]
+
+
+def estimate_asd(psd: np.ndarray) -> float:
+    """中频段 PSD 几何均值开方，作为幅值谱密度 (ASD) 量级估计。"""
+    band = midband_psd(psd)
+    if len(band) == 0:
+        return float("nan")
+    return float(np.sqrt(np.exp(np.mean(np.log(band)))))
 
 
 def compute_psd(data: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
@@ -112,6 +135,11 @@ def build_plot_cache(result: ChannelResult) -> PlotCache:
     hb = result.histogram_bins
     bw = float(np.diff(hb)[0]) if len(hb) > 1 else 1.0
     px = np.linspace(hb.min(), hb.max(), 200) if len(hb) > 1 else hb.copy()
+    psd_x = result.frequencies_hz
+    if len(psd_x) >= 2:
+        psd_range = f", {psd_x[0]:.1f}~{psd_x[-1]:.1f} Hz"
+    else:
+        psd_range = ""
     return PlotCache(
         channel=result.channel,
         time_range=result.time_range,
@@ -119,12 +147,12 @@ def build_plot_cache(result: ChannelResult) -> PlotCache:
         time_y=ty,
         time_title=f"{result.channel} 时域 [{t0:.2f}~{t1:.2f}s] (σ={result.stats.std:.4g}, 峰峰值={result.stats.peak_to_peak:.4g}{note})",
         mean_line=result.stats.mean,
-        psd_x=result.frequencies_hz,
+        psd_x=psd_x,
         psd_y=np.maximum(result.psd, np.finfo(float).tiny),
-        psd_title=f"{result.channel} PSD (Welch) [{t0:.2f}~{t1:.2f}s]",
+        psd_title=f"{result.channel} PSD (Welch){psd_range} [{t0:.2f}~{t1:.2f}s]",
         allan_x=result.allan_tau_s,
         allan_y=result.allan_dev,
-        allan_title=f"{result.channel} Allan [{t0:.2f}~{t1:.2f}s]",
+        allan_title=f"{result.channel} 简化 Allan（非 OADEV） [{t0:.2f}~{t1:.2f}s]",
         hist_bins=hb,
         hist_counts=result.histogram_counts,
         hist_bar_width=bw,
@@ -187,9 +215,6 @@ def run_pipeline(
 def stats_table(results: dict[str, ChannelResult]) -> list[dict]:
     rows = []
     for r in results.values():
-        psd = r.psd
-        # 中频段 PSD 几何均值开方，近似噪声谱密度量级（单位与 PSD 一致）
-        nd = float(np.sqrt(np.median(psd[len(psd) // 10 : len(psd) * 9 // 10]))) if len(psd) >= 4 else float("nan")
         rows.append(
             {
                 "通道": r.channel,
@@ -200,7 +225,7 @@ def stats_table(results: dict[str, ChannelResult]) -> list[dict]:
                 "偏度": r.stats.skewness,
                 "峰度": r.stats.kurtosis,
                 "样本数": r.stats.n_samples,
-                "PSD噪声密度": nd,
+                "ASD估计": estimate_asd(r.psd),
             }
         )
     return rows

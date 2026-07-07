@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import tkinter as tk
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
 from sensor_noise.models import PlotCache
@@ -30,6 +30,7 @@ class PlotController:
             fig = Figure(figsize=(7, 4), dpi=100)
             canvas = FigureCanvasTkAgg(fig, master=frame)
             canvas.get_tk_widget().pack(fill="both", expand=True)
+            NavigationToolbar2Tk(canvas, frame)
             self.axes[key] = fig.add_subplot(111)
             self.canvas[key] = canvas
 
